@@ -1,0 +1,9 @@
+[package]
+name = "animated-wall"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ffmpeg-next = "7.1.0"
+image = "0.25.5"
+x11 = { version = "2.21.0", features = ["xlib"] }
