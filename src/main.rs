@@ -10,8 +10,9 @@ use ffmpeg::software::scaling::{context::Context, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 
 fn main() {
-    let (fps, mut video_frames) = load_video("video.mp4").unwrap();
-    let frame_time = std::time::Duration::from_millis(((1.0 / fps) * 1000.0) as _);
+    println!("[Info] Loading video");
+    let mut frames = load_video("video.mp4").unwrap();
+    println!("[Info] Loaded");
 
     let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
 
@@ -33,24 +34,6 @@ fn main() {
         xlib::XClearWindow(display, root);
     }
 
-    let ximgs = video_frames
-        .iter_mut()
-        .map(|frame| unsafe {
-            xlib::XCreateImage(
-                display,
-                visual.as_mut(),
-                depth as _,
-                xlib::ZPixmap,
-                0,
-                frame.as_mut_ptr() as _,
-                width as _,
-                height as _,
-                32,
-                0,
-            )
-        })
-        .collect::<Vec<_>>();
-
     let pixmap = unsafe { xlib::XCreatePixmap(display, root, width as _, height as _, depth as _) };
 
     if pixmap == 0 {
@@ -59,14 +42,23 @@ fn main() {
 
     let gc = unsafe { xlib::XCreateGC(display, root, 0, ptr::null_mut()) };
 
-    let mut frame_index = 0;
     loop {
-        if frame_index >= video_frames.len() {
-            // frame_index = 0;
-            break;
-        }
-
-        let ximg = ximgs[frame_index];
+        // this function blocks so the wallpaper is updated 24 times a second
+        let mut frame = frames.next().unwrap();
+        let ximg = unsafe {
+            xlib::XCreateImage(
+                display,
+                visual.as_mut(),
+                depth as _,
+                xlib::ZPixmap,
+                0,
+                frame.data_mut(0).as_mut_ptr() as _,
+                width as _,
+                height as _,
+                32,
+                0,
+            )
+        };
 
         unsafe {
             xlib::XPutImage(
@@ -97,31 +89,18 @@ fn main() {
 
             xlib::XFlush(display);
         }
-
-        frame_index += 1;
-
-        std::thread::sleep(frame_time);
     }
-
-    unsafe {
-        // causes double free
-        // xlib::XDestroyImage(ximg.as_mut());
-
-        xlib::XFreePixmap(display, pixmap);
-        xlib::XFreeGC(display, gc);
-        xlib::XCloseDisplay(display);
-    };
 }
 
-fn load_video(path: impl Into<String>) -> Result<(f32, Vec<Vec<u8>>), ffmpeg::Error> {
+fn load_video(
+    path: impl Into<String>,
+) -> Result<impl Iterator<Item = ffmpeg::frame::Video>, ffmpeg::Error> {
     ffmpeg::init()?;
-
-    println!("[Info] Loading video");
 
     let path = path.into();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let thread = std::thread::spawn(move || -> Result<f32, ffmpeg::Error> {
+    std::thread::spawn(move || -> Result<f32, ffmpeg::Error> {
         let Ok(mut ictx) = input(&path) else {
             panic!();
         };
@@ -133,6 +112,7 @@ fn load_video(path: impl Into<String>) -> Result<(f32, Vec<Vec<u8>>), ffmpeg::Er
 
         let frame_rate = input.avg_frame_rate();
         let frame_rate = frame_rate.numerator() as f32 / frame_rate.denominator() as f32;
+        let frame_time = std::time::Duration::from_millis(((1.0 / frame_rate) * 1000.0) as _);
 
         let video_stream_index = input.index();
 
@@ -149,45 +129,33 @@ fn load_video(path: impl Into<String>) -> Result<(f32, Vec<Vec<u8>>), ffmpeg::Er
             Flags::BILINEAR,
         )?;
 
-        let mut receive_and_process_decoded_frames =
-            move |decoder: &mut ffmpeg::decoder::Video| -> Result<(), ffmpeg::Error> {
-                let mut decoded = Video::empty();
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    let mut rgb_frame = Video::empty();
-                    scaler.run(&decoded, &mut rgb_frame)?;
-                    tx.send(Vec::from(rgb_frame.data(0))).unwrap();
+        let mut last_frame = None;
+        loop {
+            for (stream, packet) in ictx.packets() {
+                if stream.index() == video_stream_index {
+                    decoder.send_packet(&packet)?;
+
+                    // send the last rendered frame to the main thread
+                    if let Some(last_frame) = last_frame.take() {
+                        tx.send(last_frame).unwrap();
+                    }
+
+                    // render the next frame
+                    let mut decoded = Video::empty();
+                    while decoder.receive_frame(&mut decoded).is_ok() {
+                        let mut rgb_frame = Video::empty();
+                        scaler.run(&decoded, &mut rgb_frame)?;
+                        last_frame = Some(rgb_frame);
+                    }
+
+                    std::thread::sleep(frame_time);
                 }
-
-                Ok(())
-            };
-
-        for (stream, packet) in ictx.packets() {
-            if stream.index() == video_stream_index {
-                decoder.send_packet(&packet)?;
-                receive_and_process_decoded_frames(&mut decoder)?;
             }
+
+            // restart the video
+            ictx.seek(0, ..)?;
         }
-
-        decoder.send_eof()?;
-        receive_and_process_decoded_frames(&mut decoder)?;
-
-        Ok(frame_rate)
     });
 
-    let mut frames = vec![];
-    while let Ok(frame) = rx.recv() {
-        frames.push(frame);
-    }
-
-    let frame_rate = thread.join().unwrap()?;
-    println!("[Info] Loaded {} frames, {frame_rate:.1} FPS", frames.len());
-    println!(
-        "[Info] Size: {:0.2} GB",
-        (frames.len() * frames[0].len() * std::mem::size_of::<u8>()) as f32
-            / 1024.0 // KB
-            / 1024.0 // MB
-            / 1024.0 // GB
-    );
-
-    Ok((frame_rate, frames))
+    Ok(std::iter::from_fn(move || rx.recv().ok()))
 }
