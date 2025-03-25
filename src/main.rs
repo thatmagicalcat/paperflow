@@ -1,4 +1,6 @@
 use std::ptr;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use x11::xlib;
 
@@ -9,11 +11,10 @@ use ffmpeg::media::Type;
 use ffmpeg::software::scaling::{context::Context, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 
-fn main() {
-    println!("[Info] Loading video");
-    let mut frames = load_video("video.mp4").unwrap();
-    println!("[Info] Loaded");
+const REFRESH_RATE: f32 = 60.0;
+const FRAME_TIME: Duration = Duration::from_millis(((1.0 / REFRESH_RATE) * 1000.0) as _);
 
+fn main() {
     let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
 
     if display.is_null() {
@@ -23,8 +24,12 @@ fn main() {
     let screen = unsafe { xlib::XDefaultScreen(display) };
     let root = unsafe { xlib::XRootWindow(display, screen) };
 
-    let height = unsafe { xlib::XDisplayHeight(display, screen) };
-    let width = unsafe { xlib::XDisplayWidth(display, screen) };
+    let height = unsafe { xlib::XDisplayHeight(display, screen) } as u32;
+    let width = unsafe { xlib::XDisplayWidth(display, screen) } as u32;
+
+    println!("[Info] Loading video");
+    let frame_receiver = load_video("video.mp4", width, height).unwrap();
+    println!("[Info] Loaded");
 
     let depth = unsafe { xlib::XDefaultDepth(display, screen) };
     let mut visual = ptr::NonNull::new(unsafe { xlib::XDefaultVisual(display, screen) }).unwrap();
@@ -34,7 +39,7 @@ fn main() {
         xlib::XClearWindow(display, root);
     }
 
-    let pixmap = unsafe { xlib::XCreatePixmap(display, root, width as _, height as _, depth as _) };
+    let pixmap = unsafe { xlib::XCreatePixmap(display, root, width, height, depth as _) };
 
     if pixmap == 0 {
         panic!("failed to create pixmap");
@@ -42,36 +47,47 @@ fn main() {
 
     let gc = unsafe { xlib::XCreateGC(display, root, 0, ptr::null_mut()) };
 
+    let mut create_ximg = |frame: &mut ffmpeg::frame::Video| unsafe {
+        xlib::XCreateImage(
+            display,
+            visual.as_mut(),
+            depth as _,
+            xlib::ZPixmap,
+            0,
+            frame.data_mut(0).as_mut_ptr() as _,
+            width,
+            height,
+            32,
+            0,
+        )
+    };
+
+    let mut last_frame = frame_receiver.recv().unwrap();
+    let mut last_frame_ximg = create_ximg(&mut last_frame);
+
     loop {
-        // this function blocks so the wallpaper is updated 24 times a second
-        let mut frame = frames.next().unwrap();
-        let ximg = unsafe {
-            xlib::XCreateImage(
-                display,
-                visual.as_mut(),
-                depth as _,
-                xlib::ZPixmap,
-                0,
-                frame.data_mut(0).as_mut_ptr() as _,
-                width as _,
-                height as _,
-                32,
-                0,
-            )
-        };
+        match frame_receiver.try_recv() {
+            Ok(frame) => {
+                last_frame = frame;
+                last_frame_ximg = create_ximg(&mut last_frame);
+            }
+
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
 
         unsafe {
             xlib::XPutImage(
                 display,
                 pixmap,
                 gc,
-                ximg,
+                last_frame_ximg,
                 0,
                 0,
                 0,
                 0,
-                width as _,
-                height as _,
+                width,
+                height,
             );
 
             xlib::XCopyArea(
@@ -81,24 +97,33 @@ fn main() {
                 gc,
                 0,
                 0,
-                width as _,
-                height as _,
+                width ,
+                height,
                 0,
                 0,
             );
 
             xlib::XFlush(display);
+            std::thread::sleep(FRAME_TIME);
         }
+    }
+
+    unsafe {
+        xlib::XFreePixmap(display, pixmap);
+        xlib::XFreeGC(display, gc);
+        xlib::XCloseDisplay(display);
     }
 }
 
 fn load_video(
     path: impl Into<String>,
-) -> Result<impl Iterator<Item = ffmpeg::frame::Video>, ffmpeg::Error> {
+    width: u32,
+    height: u32,
+) -> Result<mpsc::Receiver<ffmpeg::frame::Video>, ffmpeg::Error> {
     ffmpeg::init()?;
 
     let path = path.into();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || -> Result<f32, ffmpeg::Error> {
         let Ok(mut ictx) = input(&path) else {
@@ -112,7 +137,8 @@ fn load_video(
 
         let frame_rate = input.avg_frame_rate();
         let frame_rate = frame_rate.numerator() as f32 / frame_rate.denominator() as f32;
-        let frame_time = std::time::Duration::from_millis(((1.0 / frame_rate) * 1000.0) as _);
+        dbg!(frame_rate);
+        let frame_time = Duration::from_millis(((1.0 / frame_rate) * 1000.0) as _);
 
         let video_stream_index = input.index();
 
@@ -124,8 +150,8 @@ fn load_video(
             decoder.width(),
             decoder.height(),
             Pixel::BGRA,
-            decoder.width(),
-            decoder.height(),
+            width,
+            height,
             Flags::BILINEAR,
         )?;
 
@@ -157,5 +183,5 @@ fn load_video(
         }
     });
 
-    Ok(std::iter::from_fn(move || rx.recv().ok()))
+    Ok(rx)
 }
